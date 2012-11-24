@@ -1,9 +1,14 @@
 """ Parallel execution management """
+import errno
+import traceback
 
 __author__ = """Copyright Andy Whitcroft 2006"""
 
-import sys, logging, os, pickle, traceback, gc, time
 from autotest.client.shared import error, utils
+import sys, logging, os, gc, time
+import cPickle as pickle
+import cgitb
+
 
 def fork_start(tmp, l):
     sys.stdout.flush()
@@ -15,7 +20,13 @@ def fork_start(tmp, l):
 
     try:
         try:
-            l()
+            # Negate the return value for os._ext(). False = os._exit(1),  True = os._exit(0)
+            status = l()
+            logging.debug("%s = l() for PID %d", status, os.getpid())
+            if status is not None:
+                status = int(not status)
+            else:
+                status = 0
         except error.AutotestError:
             raise
         except Exception, e:
@@ -26,7 +37,7 @@ def fork_start(tmp, l):
                 logging.error('child process failed')
                 # logging.exception() uses ERROR level, but we want DEBUG for
                 # the traceback
-                for line in traceback.format_exc().splitlines():
+                for line in cgitb.text(sys.exc_info()).splitlines():
                     logging.debug(line)
             finally:
                 # note that exceptions originating in this block won't make it
@@ -44,13 +55,15 @@ def fork_start(tmp, l):
             # objects referenced by the exception's traceback
             sys.exc_clear()
             gc.collect()
+            logging.debug("Exception occurred, PID %d exiting with status 1", os.getpid())
             os._exit(1)
     else:
         try:
             sys.stdout.flush()
             sys.stderr.flush()
         finally:
-            os._exit(0)
+            logging.debug("PID %d exiting with status %d", os.getpid(), status)
+            os._exit(status)
 
 
 def _check_for_subprocess_exception(temp_dir, pid):
@@ -74,13 +87,38 @@ def _check_for_subprocess_exception(temp_dir, pid):
         raise e
 
 
+def fork_poll(tmp, pid):
+    try:
+        (pid, status) = os.waitpid(pid, os.WNOHANG)
+#        logging.debug("pid = %d status = %d", pid, status)
+    except OSError as e:
+        if e.errno == errno.ECHILD:
+            return (None, None, None)
+        else:
+            return (None, None, e)
+    if (0, 0) == (pid, status):
+        return (None, None, None)
+    else:
+        # capture the exception so we can return with status as well
+        try:
+            _check_for_subprocess_exception(tmp, pid)
+        except Exception as e:
+            return (pid, status, e)
+
+    if status:
+        e = error.TestError("Test subprocess PID %d failed rc=%d" % (pid, status))
+        return (pid, status, e)
+    else:
+        return (pid, status, None)
+
+
 def fork_waitfor(tmp, pid):
     (pid, status) = os.waitpid(pid, 0)
 
     _check_for_subprocess_exception(tmp, pid)
 
     if status:
-        raise error.TestError("Test subprocess failed rc=%d" % (status))
+        raise error.TestError("Test subprocess PID %d failed rc=%d" % (pid, status))
 
 def fork_waitfor_timed(tmp, pid, timeout):
     """
@@ -109,6 +147,18 @@ def fork_waitfor_timed(tmp, pid, timeout):
 
     if status:
         raise error.TestError("Test subprocess failed rc=%d" % (status))
+
+def fork_nuke_subprocess_and_children(tmp, pid):
+    try:
+        children = [int(p) for p in utils.get_children_pids(pid)]
+    except error.CmdError:
+        children = []
+    # nuke the parent
+    utils.nuke_pid(pid)
+    # make sure all the children have died
+    for c in children:
+        utils.nuke_pid(c)
+    _check_for_subprocess_exception(tmp, pid)
 
 def fork_nuke_subprocess(tmp, pid):
     utils.nuke_pid(pid)

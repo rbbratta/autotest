@@ -18,6 +18,12 @@ from autotest.client.shared import base_packages, packages
 from autotest.client.shared.settings import settings
 from autotest.client.tools import html_report
 
+try:
+    all([True])
+except NameError:
+    # Python 2.4 is ancient
+    from autotest.client.shared.backports import all
+
 
 LAST_BOOT_TAG = object()
 JOB_PREAMBLE = """
@@ -525,9 +531,11 @@ class base_client_job(base_job.base_job):
 
 
     def _runtest(self, url, tag, timeout, args, dargs):
+        logging.debug("parent of test.runtest(%s, %s, %s, %s) is PID %s" % (url, tag, args, dargs, os.getpid()))
         try:
             l = lambda : test.runtest(self, url, tag, args, dargs)
             pid = parallel.fork_start(self.resultdir, l)
+            logging.debug("test.runtest(%s, %s, %s, %s) is PID %s" % (url, tag, args, dargs, pid))
 
             if timeout:
                 logging.debug('Waiting for pid %d for %d seconds', pid, timeout)
@@ -636,7 +644,8 @@ class base_client_job(base_job.base_job):
             self._rungroup(subdir, testname, group_func, timeout)
             return 'GOOD'
         except error.TestBaseException, detail:
-            return detail.exit_status
+            # negate this
+            return not detail.exit_status
 
 
     def _rungroup(self, subdir, testname, function, timeout, *args, **dargs):
@@ -906,48 +915,175 @@ class base_client_job(base_job.base_job):
 
         self.quit()
 
-
     def noop(self, text):
         logging.info("job: noop: " + text)
+
+    def _append_new_log_and_remove(self, old_file, new_path):
+        if os.path.exists(new_path):
+            new_log = open(new_path)
+            try:
+                old_file.write(new_log.read())
+                old_file.flush()
+            finally:
+                new_log.close()
+            os.remove(new_path)
+
+    def _make_task_func(self, task):
+        def task_func():
+            # stub out _record_indent with a process-local one
+            base_record_indent = self._record_indent
+            proc_local = self._job_state.property_factory(
+                '_state', '_record_indent.%d' % os.getpid(),
+                base_record_indent, namespace='client')
+            self.__class__._record_indent = proc_local
+            # job.run_test(*tasks[1:])
+            # job.run_test([], {})
+            logging.debug(task[1:])
+            # task[0](*task[1:])
+            # task[0](task[1], *task[2], **task[3])
+            # apply(job.run_test, args=[], dwargs={})
+            if len(task) < 3:
+                raise TypeError("parallel_failfast requires the arguments [(func1, args=[], dwargs={}, options=[]), (func2, args=[], dwargs={}, options=[])]")
+            return task[0](*task[1], **task[2])
+        return task_func
+
+    def _start_fork(self, task, log_filename):
+        assert isinstance(task, (tuple, list))
+        new_log_path = log_filename + ".%s" % (id(task))
+        self._logger.global_filename = new_log_path
+        task_func = self._make_task_func(task)
+        pid = parallel.fork_start(self.resultdir, task_func)
+        return (pid, new_log_path)
+
+    def _poll(self, pid):
+        return parallel.fork_poll(self.resultdir, pid)
+
+
+    class AsyncTest(object):
+        def __init__(self, task):
+            self.task = task
+            self.status = None
+            self.old_log_filename = self._logger.global_filename
+            self.old_log_path = os.path.join(self.resultdir, self.old_log_filename)
+
+        def start(self):
+            self.pid, self.log_filename = self._start_fork(self.task, self.old_log_filename)
+            self._logger.global_filename = self.old_log_filename
+
+        def poll(self):
+            returned_pid, returned_status, new_exception = self._poll(self.pid)
+            if returned_status is not None:
+                assert returned_pid == self.pid
+                self.status = returned_status
+                logging.debug("PID %d returned %d", returned_pid, returned_status)
+                old_log = open(self.old_log_path, "a")
+                try:
+                    self._append_new_log_and_remove(old_log, self.log_filename)
+                finally:
+                    old_log.close()
+            return (returned_pid, returned_status, new_exception)
+
+
+    @_run_test_complete_on_exit
+    def parallel_failfast(self, tasks=[], poll_interval=5):
+        """Run tasks in parallel"""
+
+        # ignoring status is a attribute of the task.
+
+        old_log_filename = self._logger.global_filename
+        for task in tasks:
+            task['pid'], task['log_filename'] = self._start_fork(task['task'], old_log_filename)
+            task['status'] = None
+
+        old_log_path = os.path.join(self.resultdir, old_log_filename)
+        old_log = open(old_log_path, "a")
+        try:
+            exceptions = []
+
+            while True:
+                # Only check running processes, None status means the process has not exited.
+                for task in tasks:
+                    if task['status'] is not None:
+                        continue
+                    # wait for the task to finish
+                    returned_pid, returned_status, new_exception = self._poll(task['pid'])
+                    if new_exception:
+                        exceptions.append(new_exception)
+                    if returned_status is not None:
+                        assert returned_pid == task['pid']
+                        task['status'] = returned_status
+                        logging.debug("PID %d returned %d", returned_pid, returned_status)
+
+                    # for each type, do the right thing.
+                    if (('last' in task) and (returned_status is not None or new_exception) or
+                         (('failfast' in task) and (returned_status > 0 or new_exception))):
+                        self._append_new_log_and_remove(old_log, task['log_filename'])
+                        logging.info("Task %d has exited, poll other tasks then kill them", task['pid'])
+
+                        # reap any exited tasks
+                        for other_task in tasks:
+                            if other_task['status'] is not None:
+                                # already have status, so the process has exited
+                                continue
+                            logging.debug("polling other task %d", other_task['pid'])
+                            returned_pid, returned_status, new_exception = self._poll(other_task['pid'])
+                            if new_exception:
+                                exceptions.append(new_exception)
+                            # still running, there should be no exception and status should be None
+                            if returned_status is None and not new_exception:
+                                # still running, kill it
+                                logging.debug("Kill other task %d", other_task['pid'])
+                                parallel.fork_nuke_subprocess_and_children(self.resultdir, other_task['pid'])
+                                if 'ignore_status' not in other_task:
+                                    time.sleep(1)
+                                    # wait and then reap it.
+                                    returned_pid, returned_status, new_exception = self._poll(other_task['pid'])
+                                    if new_exception:
+                                        exceptions.append(new_exception)
+                                    other_task['status'] = returned_status
+                            self._append_new_log_and_remove(old_log, other_task['log_filename'])
+
+                        self._logger.global_filename = old_log_filename
+
+                        # handle any exceptions raised by the parallel tasks
+                        if exceptions:
+                            msg = "%d task(s) failed in job.parallel" % len(exceptions)
+                            for ex in exceptions:
+                                traceback.print_exception(type(ex), ex, None)
+                            raise error.JobError(msg)
+                        return
+
+                # all tasks has finished
+                if all((t['status'] is not None for t in tasks)):
+                    break
+                time.sleep(poll_interval)
+        finally:
+            old_log.close()
+
+        self._logger.global_filename = old_log_filename
 
 
     @_run_test_complete_on_exit
     def parallel(self, *tasklist):
         """Run tasks in parallel"""
 
-        pids = []
         old_log_filename = self._logger.global_filename
-        for i, task in enumerate(tasklist):
-            assert isinstance(task, (tuple, list))
-            self._logger.global_filename = old_log_filename + (".%d" % i)
-            def task_func():
-                # stub out _record_indent with a process-local one
-                base_record_indent = self._record_indent
-                proc_local = self._job_state.property_factory(
-                    '_state', '_record_indent.%d' % os.getpid(),
-                    base_record_indent, namespace='client')
-                self.__class__._record_indent = proc_local
-                task[0](*task[1:])
-            pids.append(parallel.fork_start(self.resultdir, task_func))
+        pids_and_logfilenames = (self._start_fork(task, old_log_filename) for task in tasklist)
 
         old_log_path = os.path.join(self.resultdir, old_log_filename)
         old_log = open(old_log_path, "a")
-        exceptions = []
-        for i, pid in enumerate(pids):
-            # wait for the task to finish
-            try:
-                parallel.fork_waitfor(self.resultdir, pid)
-            except Exception, e:
-                exceptions.append(e)
-            # copy the logs from the subtask into the main log
-            new_log_path = old_log_path + (".%d" % i)
-            if os.path.exists(new_log_path):
-                new_log = open(new_log_path)
-                old_log.write(new_log.read())
-                new_log.close()
-                old_log.flush()
-                os.remove(new_log_path)
-        old_log.close()
+        try:
+            exceptions = []
+            for pid, new_log_filename in pids_and_logfilenames:
+                # wait for the task to finish
+                try:
+                    parallel.fork_waitfor(self.resultdir, pid)
+                except Exception, e:
+                    exceptions.append(e)
+                # copy the logs from the subtask into the main log
+                self._append_new_log_and_remove(old_log, new_log_filename)
+        finally:
+            old_log.close()
 
         self._logger.global_filename = old_log_filename
 
