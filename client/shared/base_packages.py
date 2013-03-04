@@ -397,7 +397,11 @@ class GitFetcher(RepositoryFetcher):
         """
         logging.info('Fetching %s from %s to %s', filename, self.url,
                      dest_path)
-        name, _ = self.pkgmgr.parse_tarball_name(filename)
+        try:
+            name, _ = self.pkgmgr.parse_tarball_name(filename)
+        except ValueError as e:
+            # convert to error.PackageFetchError so we continue fetching logic
+            raise error.PackageFetchError(e.message)
         package_path = self.branch + " " + name
         try:
             cmd = self.git_archive_cmd_pattern % (self.url, dest_path, package_path)
@@ -1116,8 +1120,11 @@ class BasePackageManager(object):
         @returns (name, pkg_type) where name is the package name and pkg_type
             is the package type.
         """
-        match = re.search(r'^([^-]*)-(.*)\.tar\.bz2$', tarball_name)
-        pkg_type, name = match.groups()
+        try:
+            match = re.search(r'^([^-]*)-(.*)\.tar\.bz2$', tarball_name)
+            pkg_type, name = match.groups()
+        except AttributeError:
+            raise ValueError("%s is not a valid tarball name of the form package_type-name.tar.bz2" % tarball_name)
         return name, pkg_type
 
 

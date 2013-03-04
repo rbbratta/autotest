@@ -41,5 +41,35 @@ class TestParseSSH(unittest.TestCase):
         ]:
             self.assertEqual(expected, base_packages.parse_ssh_path(val))
 
+
+class TestParseTarball(unittest.TestCase):
+
+    def test_parse_tarball_name(self):
+        for val, expected in [
+            ("dep-foo.tar.bz2", ("foo", "dep")),
+            ("test-foo.tar.bz2", ("foo", "test")),
+            ("client-foo.tar.bz2", ("foo", "client")),
+            ("profiler-foo.tar.bz2", ("foo", "profiler")),
+            ("tar-tar.tar.bz2", ("tar", "tar")),
+            ("-tar.bz2.tar.bz2", ("tar.bz2", "")),
+            ("tar.bz2-.tar.bz2", ("", "tar.bz2")),
+            ("profiler-.tar.bz2", ("", "profiler")),
+            ("   -   .tar.bz2", ("   ", "   ")),
+        ]:
+            self.assertEquals(
+                expected, base_packages.BasePackageManager.parse_tarball_name(val))
+
+    def test_parse_tarball_raise_valuerror(self):
+        for val in [
+            "",
+            "bad.tar",
+            "packages.checksum",
+            "tar.bz2.tar.bz2",
+            ".tar.bz2",
+        ]:
+            self.assertRaises(
+                ValueError, base_packages.BasePackageManager.parse_tarball_name, val)
+
+
 if __name__ == "__main__":
     unittest.main()
