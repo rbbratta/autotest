@@ -981,8 +981,11 @@ class BasePackageManager(object):
         Compute the MD5 checksum for the package file and return it.
         pkg_path : The complete path for the package file
         '''
-        md5sum_output = self._run_command("md5sum %s " % pkg_path).stdout
-        return md5sum_output.split()[0]
+        try:
+            md5sum_output = self._run_command("md5sum %s " % pkg_path).stdout
+            return md5sum_output.split()[0]
+        except error.CmdError as e:
+            raise ValueError(e.message)
 
 
     def update_checksum(self, pkg_path):
@@ -1027,7 +1030,10 @@ class BasePackageManager(object):
             return False
 
         repository_checksum = checksum_dict[package_name]
-        local_checksum = self.compute_checksum(pkg_path)
+        try:
+            local_checksum = self.compute_checksum(pkg_path)
+        except ValueError:
+            return False
         return (local_checksum == repository_checksum)
 
 
