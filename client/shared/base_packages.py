@@ -341,13 +341,25 @@ class HttpFetcher(RepositoryFetcher):
 class GitFetcher(RepositoryFetcher):
     """
     A git based repository fetcher
+
+    This uses git archive --remote= which may require
+        git config daemon.uploadarch true
+    configured in the remote repository
+
+    This fetcher expects the following layout:
+    Example for package "iometer"
+
+    remote.git/
+        iometer/   # subdir so we can have multiple packages in a repo
+            iometer.py  # build script
+            src/  # by convention use src/ to match other Fetcher
     """
 
 
-    #
+    # this may require git config daemon.uploadarch true on the remote git-daemon
     # force create a .tar, we will bzip2 it later
     # parameters: url, destination file path (e.g. foo.tar), <branch>:<file name>
-    git_archive_cmd_pattern = 'git archive --format=tar --remote=%s -o %s %s'
+    git_archive_cmd_pattern = 'git archive --format=tar --remote=%(url)s -o %(dest_path)s %(branch)s %(subdir)s'
 
 
     def __init__(self, package_manager, repository_url):
@@ -357,7 +369,7 @@ class GitFetcher(RepositoryFetcher):
         @type package_manager: BasePackageManager class
         @param package_manager: and instance of BasePackageManager class
         @type repository_url: string
-        @param repository_url: The base URL of the git repository
+        @param repository_url: The base URL of the git repository, with optional ":branch_name" suffix.
         """
         super(GitFetcher, self).__init__(package_manager, repository_url)
         self._set_repo_url_branch(repository_url)
@@ -368,9 +380,10 @@ class GitFetcher(RepositoryFetcher):
     def _set_repo_url_branch(self, repository_url):
         '''
         Parse the url, look for a branch and set it accordingly
+        e.g. git://example.com/repo.git:branch_name
 
         @type repository_url: string
-        @param repository_url: The base URL of the git repository
+        @param repository_url: The base URL of the git repository, with optional ":branch_name" suffix.
         '''
         #do we have branch info in the repoistory_url?
         branch = "master"
@@ -390,6 +403,10 @@ class GitFetcher(RepositoryFetcher):
         a bz2'd tarball file.  However 'filename' is <type>-<name>.tar.bz2
         break this up and only fetch <name>.
 
+        This uses git archive --remote= which may require
+            git config daemon.uploadarch true
+        configured in the remote repository
+
         @type filename: string
         @param filename: The filename of the package file to fetch.
         @type dest_path: string
@@ -402,12 +419,16 @@ class GitFetcher(RepositoryFetcher):
         except ValueError as e:
             # convert to error.PackageFetchError so we continue fetching logic
             raise error.PackageFetchError(e.message)
-        package_path = self.branch + " " + name
         try:
             # we expect dest_path to bat *.tar.bz2,
             # git archive makes a .tar, not a .tar.bz2, so create a .tar and bzip2 it
             regular_tar_path = re.sub(r"\.bz2$", "", dest_path)
-            cmd = self.git_archive_cmd_pattern % (self.url, regular_tar_path, package_path)
+            cmd = self.git_archive_cmd_pattern % dict(
+                url=self.url,
+                dest_path=regular_tar_path,
+                branch=self.branch,
+                subdir=name,
+            )
             result = self.run_command(cmd)
 
             file_exists = self.run_command(
@@ -430,11 +451,11 @@ class GitFetcher(RepositoryFetcher):
                 logging.error('bzip2 %s failed: %s', (regular_tar_path, result))
                 raise error.CmdError(cmd, result)
 
-            logging.debug('Successfully fetched %s from %s', package_path,
-                          self.url)
+            logging.debug('Successfully fetched %s from %s %s', name,
+                          self.url, self.branch)
         except error.CmdError:
-            raise error.PackageFetchError('%s not found in %s' % (name,
-                                                                  package_path))
+            raise error.PackageFetchError('%s not found in %s %s' % (name, self.url,
+                                                                  self.branch))
 
 
     def install_pkg_post(self, filename, fetch_dir, install_dir,
