@@ -345,9 +345,9 @@ class GitFetcher(RepositoryFetcher):
 
 
     #
-    # parameters: url, destination file path, <branch>:<file name>
-    #
-    git_archive_cmd_pattern = 'git archive --remote=%s -o %s %s'
+    # force create a .tar, we will bzip2 it later
+    # parameters: url, destination file path (e.g. foo.tar), <branch>:<file name>
+    git_archive_cmd_pattern = 'git archive --format=tar --remote=%s -o %s %s'
 
 
     def __init__(self, package_manager, repository_url):
@@ -404,14 +404,30 @@ class GitFetcher(RepositoryFetcher):
             raise error.PackageFetchError(e.message)
         package_path = self.branch + " " + name
         try:
-            cmd = self.git_archive_cmd_pattern % (self.url, dest_path, package_path)
+            # we expect dest_path to bat *.tar.bz2,
+            # git archive makes a .tar, not a .tar.bz2, so create a .tar and bzip2 it
+            regular_tar_path = re.sub(r"\.bz2$", "", dest_path)
+            cmd = self.git_archive_cmd_pattern % (self.url, regular_tar_path, package_path)
+            result = self.run_command(cmd)
+
+            file_exists = self.run_command(
+                'ls %s' % regular_tar_path,
+                _run_command_dargs={'ignore_status': True}).exit_status == 0
+            if not file_exists:
+                logging.error('git archive failed: %s', result)
+                raise error.CmdError(cmd, result)
+
+            if _PBZIP2_AVAILABLE:
+                cmd = "pbzip2 %s" % regular_tar_path
+            else:
+                cmd = "bzip2 %s" % regular_tar_path
             result = self.run_command(cmd)
 
             file_exists = self.run_command(
                 'ls %s' % dest_path,
                 _run_command_dargs={'ignore_status': True}).exit_status == 0
             if not file_exists:
-                logging.error('git archive failed: %s', result)
+                logging.error('bzip2 %s failed: %s', (regular_tar_path, result))
                 raise error.CmdError(cmd, result)
 
             logging.debug('Successfully fetched %s from %s', package_path,
