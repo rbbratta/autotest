@@ -459,7 +459,7 @@ def _get_service_command_generator():
 def ServiceManager():
     """
     Detect which init program is being used, init or systemd and return a
-    class has methods to start/stop services.
+    class that has methods to start/stop services.
 
     # Get the system service manager
     service_manager = ServiceManager()
